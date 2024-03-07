@@ -19,7 +19,7 @@ package org.apache.spark.sql.execution
 
 import java.io.{BufferedWriter, OutputStreamWriter}
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.{AtomicLong, AtomicReference}
 
 import org.apache.hadoop.fs.Path
 
@@ -145,80 +145,110 @@ class QueryExecution(
     }
   }
 
-  lazy val withCachedData: LogicalPlan = sparkSession.withActive {
-    assertAnalyzed()
-    assertSupported()
-    // clone the plan to avoid sharing the plan instance between different stages like analyzing,
-    // optimizing and planning.
-    sparkSession.sharedState.cacheManager.useCachedData(normalized.clone())
+  case class State() {
+
+    lazy val withCachedData: LogicalPlan = sparkSession.withActive {
+      assertAnalyzed()
+      assertSupported()
+      // clone the plan to avoid sharing the plan instance between different stages like analyzing,
+      // optimizing and planning.
+      sparkSession.sharedState.cacheManager.useCachedData(normalized.clone())
+    }
+
+    def assertCommandExecuted(): Unit = commandExecuted
+
+    lazy val optimizedPlan: LogicalPlan = {
+      // We need to materialize the commandExecuted here because optimizedPlan is also tracked under
+      // the optimizing phase
+      assertCommandExecuted()
+      executePhase(QueryPlanningTracker.OPTIMIZATION) {
+        // clone the plan to avoid sharing the plan instance between different stages like
+        // analyzing, optimizing and planning.
+        val plan =
+          sparkSession.sessionState.optimizer.executeAndTrack(withCachedData.clone(), tracker)
+        // We do not want optimized plans to be re-analyzed as literals that have been constant
+        // folded and such can cause issues during analysis. While `clone` should maintain the
+        // `analyzed` state of the LogicalPlan, we set the plan as analyzed here as well out of
+        // paranoia.
+        plan.setAnalyzed()
+        plan
+      }
+    }
+
+    def assertOptimized(): Unit = optimizedPlan
+
+    lazy val sparkPlan: SparkPlan = {
+      // We need to materialize the optimizedPlan here because sparkPlan is also tracked under
+      // the planning phase
+      assertOptimized()
+      executePhase(QueryPlanningTracker.PLANNING) {
+        // Clone the logical plan here, in case the planner rules change the states of the logical
+        // plan.
+        QueryExecution.createSparkPlan(sparkSession, planner, optimizedPlan.clone())
+      }
+    }
+
+    def assertSparkPlanPrepared(): Unit = sparkPlan
+
+    // executedPlan should not be used to initialize any SparkPlan. It should be
+    // only used for execution.
+    lazy val executedPlan: SparkPlan = {
+      // We need to materialize the optimizedPlan here, before tracking the planning phase,
+      // to ensure that the optimization time is not counted as part of the planning phase.
+      assertOptimized()
+      val plan = executePhase(QueryPlanningTracker.PLANNING) {
+        // clone the plan to avoid sharing the plan instance between different stages,
+        // like analyzing, optimizing and planning.
+        QueryExecution.prepareForExecution(preparations, sparkPlan.clone())
+      }
+      // Note: For eagerly executed command it might have already been called in
+      // `eagerlyExecutedCommand` and is a noop here.
+      tracker.setReadyForExecution()
+      plan
+    }
+
+    def assertExecutedPlanPrepared(): Unit = executedPlan
+
+    /**
+     * Internal version of the RDD. Avoids copies and has no schema.
+     * Note for callers: Spark may apply various optimization including reusing object: this means
+     * the row is valid only for the iteration it is retrieved. You should avoid storing row and
+     * accessing after iteration. (Calling `collect()` is one of known bad usage.)
+     * If you want to store these rows into collection, please apply some converter or copy row
+     * which produces new object per iteration.
+     * Given QueryExecution is not a public class, end users are discouraged to use this: please
+     * use `Dataset.rdd` instead where conversion will be applied.
+     */
+    lazy val toRdd: RDD[InternalRow] = new SQLExecutionRDD(
+      executedPlan.execute(), sparkSession.sessionState.conf)
   }
+
+  private val stateRef: AtomicReference[State] = new AtomicReference(State())
+
+  private def stateUpdated(): State = {
+    val newWithCachedData = sparkSession.sharedState.cacheManager.useCachedData(normalized.clone())
+    val state = stateRef.get()
+    if (state.withCachedData != newWithCachedData) stateRef.set(State())
+    stateRef.get()
+  }
+
+  def withCachedData: LogicalPlan = stateUpdated().withCachedData
 
   def assertCommandExecuted(): Unit = commandExecuted
 
-  lazy val optimizedPlan: LogicalPlan = {
-    // We need to materialize the commandExecuted here because optimizedPlan is also tracked under
-    // the optimizing phase
-    assertCommandExecuted()
-    executePhase(QueryPlanningTracker.OPTIMIZATION) {
-      // clone the plan to avoid sharing the plan instance between different stages like analyzing,
-      // optimizing and planning.
-      val plan =
-        sparkSession.sessionState.optimizer.executeAndTrack(withCachedData.clone(), tracker)
-      // We do not want optimized plans to be re-analyzed as literals that have been constant
-      // folded and such can cause issues during analysis. While `clone` should maintain the
-      // `analyzed` state of the LogicalPlan, we set the plan as analyzed here as well out of
-      // paranoia.
-      plan.setAnalyzed()
-      plan
-    }
-  }
+  def optimizedPlan: LogicalPlan = stateUpdated().optimizedPlan
 
   def assertOptimized(): Unit = optimizedPlan
 
-  lazy val sparkPlan: SparkPlan = {
-    // We need to materialize the optimizedPlan here because sparkPlan is also tracked under
-    // the planning phase
-    assertOptimized()
-    executePhase(QueryPlanningTracker.PLANNING) {
-      // Clone the logical plan here, in case the planner rules change the states of the logical
-      // plan.
-      QueryExecution.createSparkPlan(sparkSession, planner, optimizedPlan.clone())
-    }
-  }
+  def sparkPlan: SparkPlan = stateUpdated().sparkPlan
 
   def assertSparkPlanPrepared(): Unit = sparkPlan
 
-  // executedPlan should not be used to initialize any SparkPlan. It should be
-  // only used for execution.
-  lazy val executedPlan: SparkPlan = {
-    // We need to materialize the optimizedPlan here, before tracking the planning phase, to ensure
-    // that the optimization time is not counted as part of the planning phase.
-    assertOptimized()
-    val plan = executePhase(QueryPlanningTracker.PLANNING) {
-      // clone the plan to avoid sharing the plan instance between different stages like analyzing,
-      // optimizing and planning.
-      QueryExecution.prepareForExecution(preparations, sparkPlan.clone())
-    }
-    // Note: For eagerly executed command it might have already been called in
-    // `eagerlyExecutedCommand` and is a noop here.
-    tracker.setReadyForExecution()
-    plan
-  }
+  def executedPlan: SparkPlan = stateUpdated().executedPlan
 
   def assertExecutedPlanPrepared(): Unit = executedPlan
 
-  /**
-   * Internal version of the RDD. Avoids copies and has no schema.
-   * Note for callers: Spark may apply various optimization including reusing object: this means
-   * the row is valid only for the iteration it is retrieved. You should avoid storing row and
-   * accessing after iteration. (Calling `collect()` is one of known bad usage.)
-   * If you want to store these rows into collection, please apply some converter or copy row
-   * which produces new object per iteration.
-   * Given QueryExecution is not a public class, end users are discouraged to use this: please
-   * use `Dataset.rdd` instead where conversion will be applied.
-   */
-  lazy val toRdd: RDD[InternalRow] = new SQLExecutionRDD(
-    executedPlan.execute(), sparkSession.sessionState.conf)
+  def toRdd: RDD[InternalRow] = stateUpdated().toRdd
 
   /** Get the metrics observed during the execution of the query plan. */
   def observedMetrics: Map[String, Row] = CollectMetricsExec.collect(executedPlan)
